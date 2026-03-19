@@ -12,29 +12,20 @@
 
 #include <stddef.h>
 
-#define LOG_E_ENABLE 1
-#define LOG_W_ENABLE 1
-#define LOG_D_ENABLE 1
-
-#if (LOG_E_ENABLE || LOG_W_ENABLE || LOG_D_ENABLE)
-#include <stdio.h>
-#define RT_I2C_BITOPS_DEBUG
-#endif
-
 #if LOG_E_ENABLE
-#define LOG_E(...) ((void)printf("[E] " __VA_ARGS__))
+#define LOG_E(...) (LOG_OUT("[E] " __VA_ARGS__))
 #else
 #define LOG_E(...) ((void)0)
 #endif
 
 #if LOG_W_ENABLE
-#define LOG_W(...) ((void)printf("[W] " __VA_ARGS__))
+#define LOG_W(...) (LOG_OUT("[W] " __VA_ARGS__))
 #else
 #define LOG_W(...) ((void)0)
 #endif
 
 #if LOG_D_ENABLE
-#define LOG_D(...) ((void)printf("[D] " __VA_ARGS__))
+#define LOG_D(...) (LOG_OUT("[D] " __VA_ARGS__))
 #else
 #define LOG_D(...) ((void)0)
 #endif
@@ -75,7 +66,7 @@ static rt_err_t SCL_H(struct rt_i2c_bit_ops *ops) {
       return -RT_ETIMEOUT;
     i2c_delay(ops);
   }
-#ifdef RT_I2C_BITOPS_DEBUG
+#if SOFT_I2C_BITOPS_DEBUG_ENABLE
   if (GET_TICK(ops) != start) {
     LOG_D("wait %u tick for SCL line to go high", GET_TICK(ops) - start);
   }
@@ -88,7 +79,7 @@ done:
 }
 
 static void i2c_start(struct rt_i2c_bit_ops *ops) {
-#ifdef RT_I2C_BITOPS_DEBUG
+#if SOFT_I2C_BITOPS_DEBUG_ENABLE
   if (ops->get_scl && !GET_SCL(ops)) {
     LOG_E("I2C bus error, SCL line low");
   }
@@ -338,55 +329,60 @@ static rt_err_t i2c_bit_send_address(struct rt_i2c_bit_ops *ops,
   return RT_EOK;
 }
 
-int32_t i2c_bit_xfer(struct rt_i2c_bit_ops *ops, struct rt_i2c_msg msgs[],
-                     uint32_t num) {
-  struct rt_i2c_msg *msg;
-  int32_t ret;
-  uint32_t i;
-  uint16_t ignore_nack;
-
-  if ((ops->i2c_pin_init_flag == RT_FALSE) && (ops->pin_init != NULL)) {
-    ops->pin_init();
-    ops->i2c_pin_init_flag = RT_TRUE;
+int32_t soft_i2c_xfer(soft_i2c_t *i2c, soft_i2c_msg_t msgs[], uint32_t num) {
+  if ((NULL == i2c) || (NULL == msgs)) {
+    return SOFT_I2C_ERROR;
   }
 
-  if (num == 0)
+  if (!i2c->init_flag) {
+    return SOFT_I2C_ERROR;
+  }
+
+  if (num == 0) {
     return 0;
+  }
+
+  soft_i2c_msg_t *msg = &msgs[0];
+  int32_t ret = SOFT_I2C_EOK;
+  uint16_t ignore_nack = 0;
+  uint32_t i = 0;
 
   for (i = 0; i < num; i++) {
     msg = &msgs[i];
-    ignore_nack = msg->flags & RT_I2C_IGNORE_NACK;
-    if (!(msg->flags & RT_I2C_NO_START)) {
+    ignore_nack = msg->flags & SOFT_I2C_IGNORE_NACK;
+    if (!(msg->flags & SOFT_I2C_NO_START)) {
       if (i) {
-        i2c_restart(ops);
+        i2c_restart(i2c);
       } else {
         LOG_D("send start condition");
-        i2c_start(ops);
+        i2c_start(i2c);
       }
-      ret = i2c_bit_send_address(ops, msg);
-      if ((ret != RT_EOK) && !ignore_nack) {
+      ret = i2c_bit_send_address(i2c, msg);
+      if ((ret != SOFT_I2C_EOK) && !ignore_nack) {
         LOG_D("receive NACK from device addr 0x%02x msg %u", msgs[i].addr, i);
         goto out;
       }
     }
-    if (msg->flags & RT_I2C_RD) {
-      ret = i2c_recv_bytes(ops, msg);
+    if (msg->flags & SOFT_I2C_RD) {
+      ret = i2c_recv_bytes(i2c, msg);
       if (ret >= 1) {
         LOG_D("read %d byte%s", ret, ret == 1 ? "" : "s");
       }
       if (ret < msg->len) {
-        if (ret >= 0)
-          ret = -RT_EIO;
+        if (ret >= 0) {
+          ret = SOFT_I2C_EIO;
+        }
         goto out;
       }
     } else {
-      ret = i2c_send_bytes(ops, msg);
+      ret = i2c_send_bytes(i2c, msg);
       if (ret >= 1) {
         LOG_D("write %d byte%s", ret, ret == 1 ? "" : "s");
       }
       if (ret < msg->len) {
-        if (ret >= 0)
-          ret = -RT_ERROR;
+        if (ret >= 0) {
+          ret = SOFT_I2C_ERROR;
+        }
         goto out;
       }
     }
@@ -394,10 +390,49 @@ int32_t i2c_bit_xfer(struct rt_i2c_bit_ops *ops, struct rt_i2c_msg msgs[],
   ret = i;
 
 out:
-  if (!(msg->flags & RT_I2C_NO_STOP)) {
+  if (!(msg->flags & SOFT_I2C_NO_STOP)) {
     LOG_D("send stop condition");
-    i2c_stop(ops);
+    i2c_stop(i2c);
   }
 
   return ret;
+}
+
+int32_t soft_i2c_init(soft_i2c_t *i2c) {
+  if (NULL == i2c) {
+    return SOFT_I2C_ERROR;
+  }
+
+  if (i2c->init_flag) {
+    return SOFT_I2C_EOK;
+  }
+
+  if ((NULL == i2c->io.get_scl) || (NULL == i2c->io.get_sda) ||
+      (NULL == i2c->io.set_scl) || (NULL == i2c->io.set_sda) ||
+      (NULL == i2c->sys.udelay) || (NULL == i2c->sys.get_tick)) {
+    return SOFT_I2C_ERROR;
+  }
+
+  if (NULL != i2c->io.pin_init) {
+    int32_t ret = i2c->io.pin_init(i2c->user_data);
+    if (SOFT_I2C_EOK != ret) {
+      return ret;
+    }
+  }
+
+  i2c->init_flag = true;
+
+  return SOFT_I2C_EOK;
+}
+
+void soft_i2c_deinit(soft_i2c_t *i2c) {
+  if (NULL == i2c) {
+    return;
+  }
+
+  if (NULL != i2c->io.pin_deinit) {
+    i2c->io.pin_deinit(i2c->user_data);
+  }
+
+  i2c->init_flag = false;
 }
