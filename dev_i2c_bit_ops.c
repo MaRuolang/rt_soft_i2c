@@ -586,7 +586,8 @@ int32_t soft_i2c_xfer(soft_i2c_t *i2c, soft_i2c_msg_t msgs[], uint32_t num) {
   ret = (int32_t)msg_index;
 
 out:
-  if (transfer_active && (msg != NULL) && ((msg->flags & SOFT_I2C_NO_STOP) == 0U)) {
+  if (transfer_active && (msg != NULL) &&
+      ((msg->flags & SOFT_I2C_NO_STOP) == 0U)) {
     int32_t stop_ret = SOFT_I2C_EOK;
 
     SOFT_I2C_LOG_D("send stop condition");
