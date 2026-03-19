@@ -12,394 +12,597 @@
 
 #include <stddef.h>
 
-#if LOG_E_ENABLE
-#define LOG_E(...) (LOG_OUT("[E] " __VA_ARGS__))
+#if SOFT_I2C_LOG_E_ENABLE
+#define SOFT_I2C_LOG_E(...) (SOFT_I2C_LOG_OUT("[E] " __VA_ARGS__))
 #else
-#define LOG_E(...) ((void)0)
+#define SOFT_I2C_LOG_E(...) ((void)0)
 #endif
 
-#if LOG_W_ENABLE
-#define LOG_W(...) (LOG_OUT("[W] " __VA_ARGS__))
+#if SOFT_I2C_LOG_W_ENABLE
+#define SOFT_I2C_LOG_W(...) (SOFT_I2C_LOG_OUT("[W] " __VA_ARGS__))
 #else
-#define LOG_W(...) ((void)0)
+#define SOFT_I2C_LOG_W(...) ((void)0)
 #endif
 
-#if LOG_D_ENABLE
-#define LOG_D(...) (LOG_OUT("[D] " __VA_ARGS__))
+#if SOFT_I2C_LOG_D_ENABLE
+#define SOFT_I2C_LOG_D(...) (SOFT_I2C_LOG_OUT("[D] " __VA_ARGS__))
 #else
-#define LOG_D(...) ((void)0)
+#define SOFT_I2C_LOG_D(...) ((void)0)
 #endif
 
-#define SET_SDA(ops, val) ops->set_sda(ops->data, val)
-#define SET_SCL(ops, val) ops->set_scl(ops->data, val)
-#define GET_SDA(ops) ops->get_sda(ops->data)
-#define GET_SCL(ops) ops->get_scl(ops->data)
+#define SOFT_I2C_SET_SDA(i2c, val) ((i2c)->io.set_sda((i2c)->user_data, (val)))
+#define SOFT_I2C_SET_SCL(i2c, val) ((i2c)->io.set_scl((i2c)->user_data, (val)))
+#define SOFT_I2C_GET_SDA(i2c) ((i2c)->io.get_sda((i2c)->user_data))
+#define SOFT_I2C_GET_SCL(i2c) ((i2c)->io.get_scl((i2c)->user_data))
+#define SOFT_I2C_GET_TICK(i2c) ((i2c)->sys.get_tick((i2c)->user_data))
 
-#define GET_TICK(ops) ((ops)->tick_get())
-
-static inline void i2c_delay(struct rt_i2c_bit_ops *ops) {
-  ops->udelay((ops->delay_us + 1) >> 1);
-}
-
-static inline void i2c_delay2(struct rt_i2c_bit_ops *ops) {
-  ops->udelay(ops->delay_us);
-}
-
-#define SDA_L(ops) SET_SDA(ops, 0)
-#define SDA_H(ops) SET_SDA(ops, 1)
-#define SCL_L(ops) SET_SCL(ops, 0)
+#define SOFT_I2C_SDA_LOW(i2c) SOFT_I2C_SET_SDA((i2c), 0)
+#define SOFT_I2C_SDA_HIGH(i2c) SOFT_I2C_SET_SDA((i2c), 1)
+#define SOFT_I2C_SCL_LOW(i2c) SOFT_I2C_SET_SCL((i2c), 0)
 
 /**
- * release scl line, and wait scl line to high.
+ * @brief 按半个时钟周期执行延时。
+ *
+ * @param[in] i2c 软件 I2C 对象。
  */
-static rt_err_t SCL_H(struct rt_i2c_bit_ops *ops) {
-  uint32_t start;
+static inline void soft_i2c_delay_half(soft_i2c_t *i2c) {
+  i2c->sys.udelay(i2c->user_data, (i2c->cfg.delay_us + 1U) >> 1);
+}
 
-  SET_SCL(ops, 1);
+/**
+ * @brief 按一个完整时钟周期执行延时。
+ *
+ * @param[in] i2c 软件 I2C 对象。
+ */
+static inline void soft_i2c_delay_full(soft_i2c_t *i2c) {
+  i2c->sys.udelay(i2c->user_data, i2c->cfg.delay_us);
+}
 
-  if (!ops->get_scl)
-    goto done;
-
-  start = GET_TICK(ops);
-  while (!GET_SCL(ops)) {
-    if ((GET_TICK(ops) - start) > ops->timeout)
-      return -RT_ETIMEOUT;
-    i2c_delay(ops);
+/**
+ * @brief 校验对象配置并补齐默认参数。
+ *
+ * @param[in,out] i2c 软件 I2C 对象。
+ *
+ * @note `get_scl` 为可选回调，仅在启用 SCL 实际电平检测时要求同时提供
+ *       `get_tick`。
+ *
+ * @return 成功返回 `SOFT_I2C_EOK`，失败返回负错误码。
+ */
+static int32_t soft_i2c_prepare_context(soft_i2c_t *i2c) {
+  if (i2c == NULL) {
+    return SOFT_I2C_ERROR;
   }
+
+  if ((i2c->io.set_sda == NULL) || (i2c->io.set_scl == NULL) ||
+      (i2c->io.get_sda == NULL) || (i2c->sys.udelay == NULL)) {
+    return SOFT_I2C_ERROR;
+  }
+
+  if ((i2c->io.get_scl != NULL) && (i2c->sys.get_tick == NULL)) {
+    return SOFT_I2C_ERROR;
+  }
+
+  if (i2c->cfg.delay_us == 0U) {
+    i2c->cfg.delay_us = SOFT_I2C_DEFAULT_DELAY_US;
+  }
+
+  if ((i2c->io.get_scl != NULL) && (i2c->cfg.timeout_tick == 0U)) {
+    i2c->cfg.timeout_tick = SOFT_I2C_DEFAULT_TIMEOUT_TICK;
+  }
+
+  return SOFT_I2C_EOK;
+}
+
+/**
+ * @brief 释放 SCL 线并等待其真正变为高电平。
+ *
+ * @param[in] i2c 软件 I2C 对象。
+ *
+ * @return 成功返回 `SOFT_I2C_EOK`，超时返回 `SOFT_I2C_ETIMEOUT`。
+ */
+static int32_t soft_i2c_release_scl(soft_i2c_t *i2c) {
+  uint32_t start_tick = 0U;
+
+  SOFT_I2C_SET_SCL(i2c, 1);
+
+  if (i2c->io.get_scl == NULL) {
+    goto done;
+  }
+
+  start_tick = SOFT_I2C_GET_TICK(i2c);
+  while (!SOFT_I2C_GET_SCL(i2c)) {
+    if ((SOFT_I2C_GET_TICK(i2c) - start_tick) > i2c->cfg.timeout_tick) {
+      return SOFT_I2C_ETIMEOUT;
+    }
+    soft_i2c_delay_half(i2c);
+  }
+
 #if SOFT_I2C_BITOPS_DEBUG_ENABLE
-  if (GET_TICK(ops) != start) {
-    LOG_D("wait %u tick for SCL line to go high", GET_TICK(ops) - start);
+  if (SOFT_I2C_GET_TICK(i2c) != start_tick) {
+    SOFT_I2C_LOG_D("wait %lu tick for SCL line to go high",
+                   (unsigned long)(SOFT_I2C_GET_TICK(i2c) - start_tick));
   }
 #endif
 
 done:
-  i2c_delay(ops);
+  soft_i2c_delay_half(i2c);
 
-  return RT_EOK;
+  return SOFT_I2C_EOK;
 }
 
-static void i2c_start(struct rt_i2c_bit_ops *ops) {
+/**
+ * @brief 发送起始信号。
+ *
+ * @param[in] i2c 软件 I2C 对象。
+ */
+static void soft_i2c_start(soft_i2c_t *i2c) {
 #if SOFT_I2C_BITOPS_DEBUG_ENABLE
-  if (ops->get_scl && !GET_SCL(ops)) {
-    LOG_E("I2C bus error, SCL line low");
+  if ((i2c->io.get_scl != NULL) && !SOFT_I2C_GET_SCL(i2c)) {
+    SOFT_I2C_LOG_E("I2C bus error, SCL line low");
   }
-  if (ops->get_sda && !GET_SDA(ops)) {
-    LOG_E("I2C bus error, SDA line low");
+  if (!SOFT_I2C_GET_SDA(i2c)) {
+    SOFT_I2C_LOG_E("I2C bus error, SDA line low");
   }
 #endif
-  SDA_L(ops);
-  i2c_delay(ops);
-  SCL_L(ops);
+
+  SOFT_I2C_SDA_LOW(i2c);
+  soft_i2c_delay_half(i2c);
+  SOFT_I2C_SCL_LOW(i2c);
 }
 
-static void i2c_restart(struct rt_i2c_bit_ops *ops) {
-  SDA_H(ops);
-  SCL_H(ops);
-  i2c_delay(ops);
-  SDA_L(ops);
-  i2c_delay(ops);
-  SCL_L(ops);
-}
+/**
+ * @brief 发送重复起始信号。
+ *
+ * @param[in] i2c 软件 I2C 对象。
+ *
+ * @return 成功返回 `SOFT_I2C_EOK`，失败返回负错误码。
+ */
+static int32_t soft_i2c_restart(soft_i2c_t *i2c) {
+  int32_t ret = SOFT_I2C_EOK;
 
-static void i2c_stop(struct rt_i2c_bit_ops *ops) {
-  SDA_L(ops);
-  i2c_delay(ops);
-  SCL_H(ops);
-  i2c_delay(ops);
-  SDA_H(ops);
-  i2c_delay2(ops);
-}
-
-static inline rt_bool_t i2c_waitack(struct rt_i2c_bit_ops *ops) {
-  rt_bool_t ack;
-
-  SDA_H(ops);
-  i2c_delay(ops);
-
-  if (SCL_H(ops) < 0) {
-    LOG_W("wait ack timeout");
-
-    return -RT_ETIMEOUT;
+  SOFT_I2C_SDA_HIGH(i2c);
+  ret = soft_i2c_release_scl(i2c);
+  if (ret != SOFT_I2C_EOK) {
+    return ret;
   }
 
-  ack = !GET_SDA(ops); /* ACK : SDA pin is pulled low */
-  LOG_D("%s", ack ? "ACK" : "NACK");
+  soft_i2c_delay_half(i2c);
+  SOFT_I2C_SDA_LOW(i2c);
+  soft_i2c_delay_half(i2c);
+  SOFT_I2C_SCL_LOW(i2c);
 
-  SCL_L(ops);
+  return SOFT_I2C_EOK;
+}
+
+/**
+ * @brief 发送停止信号。
+ *
+ * @param[in] i2c 软件 I2C 对象。
+ *
+ * @return 成功返回 `SOFT_I2C_EOK`，失败返回负错误码。
+ */
+static int32_t soft_i2c_stop(soft_i2c_t *i2c) {
+  int32_t ret = SOFT_I2C_EOK;
+
+  SOFT_I2C_SDA_LOW(i2c);
+  soft_i2c_delay_half(i2c);
+
+  ret = soft_i2c_release_scl(i2c);
+  if (ret != SOFT_I2C_EOK) {
+    return ret;
+  }
+
+  soft_i2c_delay_half(i2c);
+  SOFT_I2C_SDA_HIGH(i2c);
+  soft_i2c_delay_full(i2c);
+
+  return SOFT_I2C_EOK;
+}
+
+/**
+ * @brief 等待从机 ACK/NACK。
+ *
+ * @param[in] i2c 软件 I2C 对象。
+ *
+ * @return `1` 表示 ACK，`0` 表示 NACK，负值表示错误。
+ */
+static int32_t soft_i2c_wait_ack(soft_i2c_t *i2c) {
+  int32_t ack = 0;
+  int32_t ret = SOFT_I2C_EOK;
+
+  SOFT_I2C_SDA_HIGH(i2c);
+  soft_i2c_delay_half(i2c);
+
+  ret = soft_i2c_release_scl(i2c);
+  if (ret != SOFT_I2C_EOK) {
+    SOFT_I2C_LOG_W("wait ack timeout");
+    return ret;
+  }
+
+  ack = !SOFT_I2C_GET_SDA(i2c);
+  SOFT_I2C_LOG_D("%s", ack ? "ACK" : "NACK");
+
+  SOFT_I2C_SCL_LOW(i2c);
 
   return ack;
 }
 
-static int32_t i2c_writeb(struct rt_i2c_bit_ops *ops, uint8_t data) {
-  int32_t i;
-  uint8_t bit;
+/**
+ * @brief 向总线写入单个字节。
+ *
+ * @param[in] i2c 软件 I2C 对象。
+ * @param[in] data 待写入数据。
+ *
+ * @return `1` 表示收到 ACK，`0` 表示收到 NACK，负值表示错误。
+ */
+static int32_t soft_i2c_write_byte(soft_i2c_t *i2c, uint8_t data) {
+  int32_t bit_index = 0;
+  uint8_t bit_value = 0U;
+  int32_t ret = SOFT_I2C_EOK;
 
-  for (i = 7; i >= 0; i--) {
-    SCL_L(ops);
-    bit = (data >> i) & 1;
-    SET_SDA(ops, bit);
-    i2c_delay(ops);
-    if (SCL_H(ops) < 0) {
-      LOG_D("i2c_writeb: 0x%02x, "
-            "wait scl pin high timeout at bit %d",
-            data, i);
+  for (bit_index = 7; bit_index >= 0; bit_index--) {
+    SOFT_I2C_SCL_LOW(i2c);
+    bit_value = (uint8_t)((data >> bit_index) & 0x01U);
+    SOFT_I2C_SET_SDA(i2c, bit_value);
+    soft_i2c_delay_half(i2c);
 
-      return -RT_ETIMEOUT;
+    ret = soft_i2c_release_scl(i2c);
+    if (ret != SOFT_I2C_EOK) {
+      SOFT_I2C_LOG_D("i2c_writeb: 0x%02x, wait scl pin high timeout at bit %ld",
+                     (unsigned int)data, (long)bit_index);
+      return ret;
     }
   }
-  SCL_L(ops);
-  i2c_delay(ops);
 
-  return i2c_waitack(ops);
+  SOFT_I2C_SCL_LOW(i2c);
+  soft_i2c_delay_half(i2c);
+
+  return soft_i2c_wait_ack(i2c);
 }
 
-static int32_t i2c_readb(struct rt_i2c_bit_ops *ops) {
-  uint8_t i;
-  uint8_t data = 0;
+/**
+ * @brief 从总线读取单个字节。
+ *
+ * @param[in] i2c 软件 I2C 对象。
+ *
+ * @return 成功返回读取到的字节值，失败返回负错误码。
+ */
+static int32_t soft_i2c_read_byte(soft_i2c_t *i2c) {
+  uint8_t bit_index = 0U;
+  uint8_t data = 0U;
+  int32_t ret = SOFT_I2C_EOK;
 
-  SDA_H(ops);
-  i2c_delay(ops);
-  for (i = 0; i < 8; i++) {
+  SOFT_I2C_SDA_HIGH(i2c);
+  soft_i2c_delay_half(i2c);
+
+  for (bit_index = 0; bit_index < 8U; bit_index++) {
     data <<= 1;
 
-    if (SCL_H(ops) < 0) {
-      LOG_D("i2c_readb: wait scl pin high "
-            "timeout at bit %d",
-            7 - i);
-
-      return -RT_ETIMEOUT;
+    ret = soft_i2c_release_scl(i2c);
+    if (ret != SOFT_I2C_EOK) {
+      SOFT_I2C_LOG_D("i2c_readb: wait scl pin high timeout at bit %u",
+                     (unsigned int)(7U - bit_index));
+      return ret;
     }
 
-    if (GET_SDA(ops))
-      data |= 1;
-    SCL_L(ops);
-    i2c_delay2(ops);
+    if (SOFT_I2C_GET_SDA(i2c)) {
+      data |= 0x01U;
+    }
+
+    SOFT_I2C_SCL_LOW(i2c);
+    soft_i2c_delay_full(i2c);
   }
 
-  return data;
+  return (int32_t)data;
 }
 
-static int32_t i2c_send_bytes(struct rt_i2c_bit_ops *ops,
-                              struct rt_i2c_msg *msg) {
-  int32_t ret;
-  uint32_t bytes = 0;
+/**
+ * @brief 连续发送数据字节。
+ *
+ * @param[in] i2c 软件 I2C 对象。
+ * @param[in] msg I2C 消息。
+ *
+ * @return 成功返回已发送字节数，失败返回负错误码。
+ */
+static int32_t soft_i2c_send_bytes(soft_i2c_t *i2c, const soft_i2c_msg_t *msg) {
+  int32_t ret = SOFT_I2C_EOK;
+  uint32_t bytes = 0U;
   const uint8_t *ptr = msg->buf;
-  int32_t count = msg->len;
-  uint16_t ignore_nack = msg->flags & RT_I2C_IGNORE_NACK;
+  int32_t count = (int32_t)msg->len;
+  const bool ignore_nack = ((msg->flags & SOFT_I2C_IGNORE_NACK) != 0U);
 
   while (count > 0) {
-    ret = i2c_writeb(ops, *ptr);
+    ret = soft_i2c_write_byte(i2c, *ptr);
 
     if ((ret > 0) || (ignore_nack && (ret == 0))) {
       count--;
       ptr++;
       bytes++;
     } else if (ret == 0) {
-      LOG_D("send bytes: NACK.");
-
-      return 0;
+      SOFT_I2C_LOG_D("send bytes: NACK.");
+      return (int32_t)bytes;
     } else {
-      LOG_E("send bytes: error %d", ret);
-
+      SOFT_I2C_LOG_E("send bytes: error %ld", (long)ret);
       return ret;
     }
   }
 
-  return bytes;
+  return (int32_t)bytes;
 }
 
-static rt_err_t i2c_send_ack_or_nack(struct rt_i2c_bit_ops *ops, int ack) {
-  if (ack)
-    SET_SDA(ops, 0);
-  i2c_delay(ops);
-  if (SCL_H(ops) < 0) {
-    LOG_E("ACK or NACK timeout.");
+/**
+ * @brief 在读流程中发送 ACK 或 NACK。
+ *
+ * @param[in] i2c 软件 I2C 对象。
+ * @param[in] ack 非 0 表示发送 ACK，0 表示发送 NACK。
+ *
+ * @return 成功返回 `SOFT_I2C_EOK`，失败返回负错误码。
+ */
+static int32_t soft_i2c_send_ack_or_nack(soft_i2c_t *i2c, int32_t ack) {
+  int32_t ret = SOFT_I2C_EOK;
 
-    return -RT_ETIMEOUT;
+  SOFT_I2C_SET_SDA(i2c, ack ? 0 : 1);
+  soft_i2c_delay_half(i2c);
+
+  ret = soft_i2c_release_scl(i2c);
+  if (ret != SOFT_I2C_EOK) {
+    SOFT_I2C_LOG_E("ACK or NACK timeout.");
+    return ret;
   }
-  SCL_L(ops);
 
-  return RT_EOK;
+  SOFT_I2C_SCL_LOW(i2c);
+
+  return SOFT_I2C_EOK;
 }
 
-static int32_t i2c_recv_bytes(struct rt_i2c_bit_ops *ops,
-                              struct rt_i2c_msg *msg) {
-  int32_t val;
-  int32_t bytes = 0; /* actual bytes */
+/**
+ * @brief 连续接收数据字节。
+ *
+ * @param[in] i2c 软件 I2C 对象。
+ * @param[out] msg I2C 消息。
+ *
+ * @return 成功返回已接收字节数，失败返回负错误码。
+ */
+static int32_t soft_i2c_recv_bytes(soft_i2c_t *i2c, soft_i2c_msg_t *msg) {
+  int32_t val = SOFT_I2C_EOK;
+  int32_t bytes = 0;
   uint8_t *ptr = msg->buf;
-  int32_t count = msg->len;
+  int32_t count = (int32_t)msg->len;
   const uint32_t flags = msg->flags;
 
   while (count > 0) {
-    val = i2c_readb(ops);
-    if (val >= 0) {
-      *ptr = val;
-      bytes++;
-    } else {
-      break;
+    val = soft_i2c_read_byte(i2c);
+    if (val < 0) {
+      return val;
     }
 
+    *ptr = (uint8_t)val;
+    bytes++;
     ptr++;
     count--;
 
-    LOG_D("receive bytes: 0x%02x, %s", val,
-          (flags & RT_I2C_NO_READ_ACK) ? "(No ACK/NACK)"
-                                       : (count ? "ACK" : "NACK"));
+    SOFT_I2C_LOG_D("receive bytes: 0x%02x, %s", (unsigned int)((uint8_t)val),
+                   (flags & SOFT_I2C_NO_READ_ACK)
+                       ? "(No ACK/NACK)"
+                       : (count > 0 ? "ACK" : "NACK"));
 
-    if (!(flags & RT_I2C_NO_READ_ACK)) {
-      val = i2c_send_ack_or_nack(ops, count);
-      if (val < 0)
+    if ((flags & SOFT_I2C_NO_READ_ACK) == 0U) {
+      val = soft_i2c_send_ack_or_nack(i2c, (count > 0));
+      if (val < 0) {
         return val;
+      }
     }
   }
 
   return bytes;
 }
 
-static int32_t i2c_send_address(struct rt_i2c_bit_ops *ops, uint8_t addr,
-                                int32_t retries) {
-  int32_t i;
-  rt_err_t ret = 0;
+/**
+ * @brief 向从机发送地址字节，并按需执行重试。
+ *
+ * @param[in] i2c 软件 I2C 对象。
+ * @param[in] addr 地址字节。
+ * @param[in] retries 重试次数。
+ *
+ * @return `1` 表示收到 ACK，`0` 表示收到 NACK，负值表示错误。
+ */
+static int32_t soft_i2c_send_address_byte(soft_i2c_t *i2c, uint8_t addr,
+                                          int32_t retries) {
+  int32_t retry_index = 0;
+  int32_t ret = 0;
 
-  for (i = 0; i <= retries; i++) {
-    ret = i2c_writeb(ops, addr);
-    if (ret == 1 || i == retries)
+  for (retry_index = 0; retry_index <= retries; retry_index++) {
+    ret = soft_i2c_write_byte(i2c, addr);
+    if ((ret == 1) || (ret < 0) || (retry_index == retries)) {
       break;
-    LOG_D("send stop condition");
-    i2c_stop(ops);
-    i2c_delay2(ops);
-    LOG_D("send start condition");
-    i2c_start(ops);
+    }
+
+    SOFT_I2C_LOG_D("send stop condition");
+    ret = soft_i2c_stop(i2c);
+    if (ret < 0) {
+      return ret;
+    }
+
+    soft_i2c_delay_full(i2c);
+    SOFT_I2C_LOG_D("send start condition");
+    soft_i2c_start(i2c);
   }
 
   return ret;
 }
 
-static rt_err_t i2c_bit_send_address(struct rt_i2c_bit_ops *ops,
-                                     struct rt_i2c_msg *msg) {
-  uint16_t flags = msg->flags;
-  uint16_t ignore_nack = msg->flags & RT_I2C_IGNORE_NACK;
+/**
+ * @brief 根据消息内容发送从机地址阶段。
+ *
+ * @param[in] i2c 软件 I2C 对象。
+ * @param[in] msg I2C 消息。
+ *
+ * @return 成功返回 `SOFT_I2C_EOK`，失败返回负错误码。
+ */
+static int32_t soft_i2c_send_slave_address(soft_i2c_t *i2c,
+                                           const soft_i2c_msg_t *msg) {
+  const uint16_t flags = msg->flags;
+  const bool ignore_nack = ((flags & SOFT_I2C_IGNORE_NACK) != 0U);
+  uint8_t addr1 = 0U;
+  uint8_t addr2 = 0U;
+  int32_t retries = ignore_nack ? 0 : (int32_t)i2c->cfg.retries;
+  int32_t ret = SOFT_I2C_EOK;
 
-  uint8_t addr1, addr2;
-  int32_t retries;
-  rt_err_t ret;
+  if ((flags & SOFT_I2C_ADDR_10BIT) != 0U) {
+    addr1 = (uint8_t)(0xF0U | ((msg->addr >> 7) & 0x06U));
+    addr2 = (uint8_t)(msg->addr & 0xFFU);
 
-  retries = ignore_nack ? 0 : ops->retries;
+    SOFT_I2C_LOG_D("addr1: %u, addr2: %u", (unsigned int)addr1,
+                   (unsigned int)addr2);
 
-  if (flags & RT_I2C_ADDR_10BIT) {
-    addr1 = 0xf0 | ((msg->addr >> 7) & 0x06);
-    addr2 = msg->addr & 0xff;
-
-    LOG_D("addr1: %d, addr2: %d", addr1, addr2);
-
-    ret = i2c_send_address(ops, addr1, retries);
+    ret = soft_i2c_send_address_byte(i2c, addr1, retries);
+    if (ret < 0) {
+      return ret;
+    }
     if ((ret != 1) && !ignore_nack) {
-      LOG_W("NACK: sending first addr");
-
-      return -RT_EIO;
+      SOFT_I2C_LOG_W("NACK: sending first addr");
+      return SOFT_I2C_EIO;
     }
 
-    ret = i2c_writeb(ops, addr2);
-    if ((ret != 1) && !ignore_nack) {
-      LOG_W("NACK: sending second addr");
-
-      return -RT_EIO;
+    ret = soft_i2c_write_byte(i2c, addr2);
+    if (ret < 0) {
+      return ret;
     }
-    if (flags & RT_I2C_RD) {
-      LOG_D("send repeated start condition");
-      i2c_restart(ops);
-      addr1 |= 0x01;
-      ret = i2c_send_address(ops, addr1, retries);
+    if ((ret != 1) && !ignore_nack) {
+      SOFT_I2C_LOG_W("NACK: sending second addr");
+      return SOFT_I2C_EIO;
+    }
+
+    if ((flags & SOFT_I2C_RD) != 0U) {
+      SOFT_I2C_LOG_D("send repeated start condition");
+      ret = soft_i2c_restart(i2c);
+      if (ret < 0) {
+        return ret;
+      }
+
+      addr1 |= 0x01U;
+      ret = soft_i2c_send_address_byte(i2c, addr1, retries);
+      if (ret < 0) {
+        return ret;
+      }
       if ((ret != 1) && !ignore_nack) {
-        LOG_E("NACK: sending repeated addr");
-
-        return -RT_EIO;
+        SOFT_I2C_LOG_E("NACK: sending repeated addr");
+        return SOFT_I2C_EIO;
       }
     }
   } else {
-    /* 7-bit addr */
-    addr1 = msg->addr << 1;
-    if (flags & RT_I2C_RD)
-      addr1 |= 1;
-    ret = i2c_send_address(ops, addr1, retries);
-    if ((ret != 1) && !ignore_nack)
-      return -RT_EIO;
+    addr1 = (uint8_t)(msg->addr << 1);
+    if ((flags & SOFT_I2C_RD) != 0U) {
+      addr1 |= 0x01U;
+    }
+
+    ret = soft_i2c_send_address_byte(i2c, addr1, retries);
+    if (ret < 0) {
+      return ret;
+    }
+    if ((ret != 1) && !ignore_nack) {
+      return SOFT_I2C_EIO;
+    }
   }
 
-  return RT_EOK;
+  return SOFT_I2C_EOK;
 }
 
 int32_t soft_i2c_xfer(soft_i2c_t *i2c, soft_i2c_msg_t msgs[], uint32_t num) {
-  if ((NULL == i2c) || (NULL == msgs)) {
+  soft_i2c_msg_t *msg = NULL;
+  int32_t ret = SOFT_I2C_EOK;
+  uint32_t msg_index = 0U;
+  bool transfer_active = false;
+
+  if (i2c == NULL) {
     return SOFT_I2C_ERROR;
   }
 
-  if (!i2c->init_flag) {
-    return SOFT_I2C_ERROR;
-  }
-
-  if (num == 0) {
+  if (num == 0U) {
     return 0;
   }
 
-  soft_i2c_msg_t *msg = &msgs[0];
-  int32_t ret = SOFT_I2C_EOK;
-  uint16_t ignore_nack = 0;
-  uint32_t i = 0;
+  if ((msgs == NULL) || !i2c->init_flag) {
+    return SOFT_I2C_ERROR;
+  }
 
-  for (i = 0; i < num; i++) {
-    msg = &msgs[i];
-    ignore_nack = msg->flags & SOFT_I2C_IGNORE_NACK;
-    if (!(msg->flags & SOFT_I2C_NO_START)) {
-      if (i) {
-        i2c_restart(i2c);
+  for (msg_index = 0U; msg_index < num; msg_index++) {
+    msg = &msgs[msg_index];
+
+    if ((msg->len > 0U) && (msg->buf == NULL)) {
+      ret = SOFT_I2C_ERROR;
+      goto out;
+    }
+
+    transfer_active = true;
+
+    if ((msg->flags & SOFT_I2C_NO_START) == 0U) {
+      if (msg_index > 0U) {
+        ret = soft_i2c_restart(i2c);
+        if (ret != SOFT_I2C_EOK) {
+          goto out;
+        }
       } else {
-        LOG_D("send start condition");
-        i2c_start(i2c);
+        SOFT_I2C_LOG_D("send start condition");
+        soft_i2c_start(i2c);
       }
-      ret = i2c_bit_send_address(i2c, msg);
-      if ((ret != SOFT_I2C_EOK) && !ignore_nack) {
-        LOG_D("receive NACK from device addr 0x%02x msg %u", msgs[i].addr, i);
+
+      ret = soft_i2c_send_slave_address(i2c, msg);
+      if (ret != SOFT_I2C_EOK) {
+        SOFT_I2C_LOG_D("send address failed for device 0x%02x at msg %lu",
+                       (unsigned int)msgs[msg_index].addr,
+                       (unsigned long)msg_index);
         goto out;
       }
     }
-    if (msg->flags & SOFT_I2C_RD) {
-      ret = i2c_recv_bytes(i2c, msg);
+
+    if ((msg->flags & SOFT_I2C_RD) != 0U) {
+      ret = soft_i2c_recv_bytes(i2c, msg);
       if (ret >= 1) {
-        LOG_D("read %d byte%s", ret, ret == 1 ? "" : "s");
+        SOFT_I2C_LOG_D("read %ld byte%s", (long)ret, ret == 1 ? "" : "s");
       }
-      if (ret < msg->len) {
-        if (ret >= 0) {
-          ret = SOFT_I2C_EIO;
-        }
+      if (ret < 0) {
+        goto out;
+      }
+      if ((uint32_t)ret < msg->len) {
+        ret = SOFT_I2C_EIO;
         goto out;
       }
     } else {
-      ret = i2c_send_bytes(i2c, msg);
+      ret = soft_i2c_send_bytes(i2c, msg);
       if (ret >= 1) {
-        LOG_D("write %d byte%s", ret, ret == 1 ? "" : "s");
+        SOFT_I2C_LOG_D("write %ld byte%s", (long)ret, ret == 1 ? "" : "s");
       }
-      if (ret < msg->len) {
-        if (ret >= 0) {
-          ret = SOFT_I2C_ERROR;
-        }
+      if (ret < 0) {
+        goto out;
+      }
+      if ((uint32_t)ret < msg->len) {
+        ret = SOFT_I2C_ERROR;
         goto out;
       }
     }
   }
-  ret = i;
+
+  ret = (int32_t)msg_index;
 
 out:
-  if (!(msg->flags & SOFT_I2C_NO_STOP)) {
-    LOG_D("send stop condition");
-    i2c_stop(i2c);
+  if (transfer_active && (msg != NULL) && ((msg->flags & SOFT_I2C_NO_STOP) == 0U)) {
+    int32_t stop_ret = SOFT_I2C_EOK;
+
+    SOFT_I2C_LOG_D("send stop condition");
+    stop_ret = soft_i2c_stop(i2c);
+    if ((ret >= 0) && (stop_ret < 0)) {
+      ret = stop_ret;
+    }
   }
 
   return ret;
 }
 
 int32_t soft_i2c_init(soft_i2c_t *i2c) {
-  if (NULL == i2c) {
+  int32_t ret = SOFT_I2C_EOK;
+
+  if (i2c == NULL) {
     return SOFT_I2C_ERROR;
   }
 
@@ -407,30 +610,43 @@ int32_t soft_i2c_init(soft_i2c_t *i2c) {
     return SOFT_I2C_EOK;
   }
 
-  if ((NULL == i2c->io.get_scl) || (NULL == i2c->io.get_sda) ||
-      (NULL == i2c->io.set_scl) || (NULL == i2c->io.set_sda) ||
-      (NULL == i2c->sys.udelay) || (NULL == i2c->sys.get_tick)) {
-    return SOFT_I2C_ERROR;
+  ret = soft_i2c_prepare_context(i2c);
+  if (ret != SOFT_I2C_EOK) {
+    return ret;
   }
 
-  if (NULL != i2c->io.pin_init) {
-    int32_t ret = i2c->io.pin_init(i2c->user_data);
-    if (SOFT_I2C_EOK != ret) {
+  if (i2c->io.pin_init != NULL) {
+    ret = i2c->io.pin_init(i2c->user_data);
+    if (ret != SOFT_I2C_EOK) {
       return ret;
     }
   }
 
+  SOFT_I2C_SDA_HIGH(i2c);
+  ret = soft_i2c_release_scl(i2c);
+  if (ret != SOFT_I2C_EOK) {
+    if (i2c->io.pin_deinit != NULL) {
+      i2c->io.pin_deinit(i2c->user_data);
+    }
+    return ret;
+  }
+
+  soft_i2c_delay_full(i2c);
   i2c->init_flag = true;
 
   return SOFT_I2C_EOK;
 }
 
 void soft_i2c_deinit(soft_i2c_t *i2c) {
-  if (NULL == i2c) {
+  if ((i2c == NULL) || !i2c->init_flag) {
     return;
   }
 
-  if (NULL != i2c->io.pin_deinit) {
+  SOFT_I2C_SDA_HIGH(i2c);
+  (void)soft_i2c_release_scl(i2c);
+  soft_i2c_delay_full(i2c);
+
+  if (i2c->io.pin_deinit != NULL) {
     i2c->io.pin_deinit(i2c->user_data);
   }
 
