@@ -188,16 +188,57 @@ static int32_t soft_i2c_stop(soft_i2c_t *i2c) {
   soft_i2c_delay_half(i2c);
 
   ret = soft_i2c_release_scl(i2c);
-  if (ret != SOFT_I2C_EOK) {
-    return ret;
-  }
-
   soft_i2c_delay_half(i2c);
   SOFT_I2C_SDA_HIGH(i2c);
   soft_i2c_delay_full(i2c);
 
-  return SOFT_I2C_EOK;
+  return ret;
 }
+
+#if SOFT_I2C_INIT_BUS_RECOVERY_ENABLE
+/**
+ * @brief 在初始化阶段尝试执行 I2C 总线恢复。
+ *
+ * @param[in] i2c 软件 I2C 对象。
+ *
+ * @note 仅当检测到 SDA 被拉低且支持 SCL 实际电平检测时执行。恢复成功后会
+ *       额外发送一次 STOP，以确保总线回到空闲态。
+ *
+ * @return 成功返回 `SOFT_I2C_EOK`，失败返回负错误码。
+ */
+static int32_t soft_i2c_recover_bus(soft_i2c_t *i2c) {
+  uint32_t pulse_index = 0U;
+  int32_t ret = SOFT_I2C_EOK;
+
+  if ((i2c->io.get_scl == NULL) || SOFT_I2C_GET_SDA(i2c)) {
+    return SOFT_I2C_EOK;
+  }
+
+  SOFT_I2C_LOG_W("SDA line is low during init, try to recover I2C bus");
+
+  for (pulse_index = 0U; pulse_index < SOFT_I2C_BUS_RECOVERY_PULSE_COUNT;
+       pulse_index++) {
+    SOFT_I2C_SCL_LOW(i2c);
+    soft_i2c_delay_full(i2c);
+
+    ret = soft_i2c_release_scl(i2c);
+    if (ret != SOFT_I2C_EOK) {
+      return ret;
+    }
+
+    if (SOFT_I2C_GET_SDA(i2c)) {
+      break;
+    }
+  }
+
+  if (!SOFT_I2C_GET_SDA(i2c)) {
+    SOFT_I2C_LOG_E("I2C bus recovery failed, SDA line is still low");
+    return SOFT_I2C_EIO;
+  }
+
+  return soft_i2c_stop(i2c);
+}
+#endif
 
 /**
  * @brief 等待从机 ACK/NACK。
@@ -508,6 +549,27 @@ static int32_t soft_i2c_send_slave_address(soft_i2c_t *i2c,
   return SOFT_I2C_EOK;
 }
 
+/**
+ * @brief 校验消息数组的基础参数合法性。
+ *
+ * @param[in] msgs 消息数组指针。
+ * @param[in] num 消息数量。
+ *
+ * @return 成功返回 `SOFT_I2C_EOK`，失败返回负错误码。
+ */
+static int32_t soft_i2c_validate_msgs(const soft_i2c_msg_t msgs[],
+                                      uint32_t num) {
+  uint32_t msg_index = 0U;
+
+  for (msg_index = 0U; msg_index < num; msg_index++) {
+    if ((msgs[msg_index].len > 0U) && (msgs[msg_index].buf == NULL)) {
+      return SOFT_I2C_ERROR;
+    }
+  }
+
+  return SOFT_I2C_EOK;
+}
+
 int32_t soft_i2c_xfer(soft_i2c_t *i2c, soft_i2c_msg_t msgs[], uint32_t num) {
   soft_i2c_msg_t *msg = NULL;
   int32_t ret = SOFT_I2C_EOK;
@@ -526,13 +588,13 @@ int32_t soft_i2c_xfer(soft_i2c_t *i2c, soft_i2c_msg_t msgs[], uint32_t num) {
     return SOFT_I2C_ERROR;
   }
 
+  ret = soft_i2c_validate_msgs(msgs, num);
+  if (ret != SOFT_I2C_EOK) {
+    return ret;
+  }
+
   for (msg_index = 0U; msg_index < num; msg_index++) {
     msg = &msgs[msg_index];
-
-    if ((msg->len > 0U) && (msg->buf == NULL)) {
-      ret = SOFT_I2C_ERROR;
-      goto out;
-    }
 
     transfer_active = true;
 
@@ -631,6 +693,16 @@ int32_t soft_i2c_init(soft_i2c_t *i2c) {
     }
     return ret;
   }
+
+#if SOFT_I2C_INIT_BUS_RECOVERY_ENABLE
+  ret = soft_i2c_recover_bus(i2c);
+  if (ret != SOFT_I2C_EOK) {
+    if (i2c->io.pin_deinit != NULL) {
+      i2c->io.pin_deinit(i2c->user_data);
+    }
+    return ret;
+  }
+#endif
 
   soft_i2c_delay_full(i2c);
   i2c->init_flag = true;

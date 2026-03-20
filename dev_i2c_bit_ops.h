@@ -51,6 +51,16 @@ extern "C" {
 #define SOFT_I2C_DEFAULT_TIMEOUT_TICK 100U /**< 默认时钟拉伸等待超时 tick。 */
 #endif
 
+#ifndef SOFT_I2C_BUS_RECOVERY_PULSE_COUNT
+#define SOFT_I2C_BUS_RECOVERY_PULSE_COUNT                                      \
+  9U /**< 总线恢复时最多发送的 SCL 脉冲数。 */
+#endif
+
+#ifndef SOFT_I2C_INIT_BUS_RECOVERY_ENABLE
+#define SOFT_I2C_INIT_BUS_RECOVERY_ENABLE                                      \
+  0 /**< 是否在初始化阶段启用总线恢复流程。 */
+#endif
+
 /**
  * @brief 软件 I2C 返回码定义。
  */
